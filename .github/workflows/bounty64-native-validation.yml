@@ -1,0 +1,73 @@
+name: Bounty 64 native validation
+
+on:
+  push:
+    branches:
+      - bounty/64-native-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: containers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.target }} / linux-${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - core
+          - browser
+          - cli
+        arch:
+          - amd64
+          - arm64
+    # Chromium probes CPU features and starts child processes; exercise each
+    # image on its native architecture instead of QEMU's host /proc view.
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/${{ matrix.arch }}
+          push: false
+          load: true
+          tags: spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.target }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}-${{ matrix.arch }}
+
+      - name: Enforce container size budget
+        run: >-
+          node scripts/container-image-size-budget.mjs
+          --target "${{ matrix.target }}"
+          --image "spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}"
+
+      - name: Start service and exercise its runtime
+        run: >-
+          node scripts/container-smoke.mjs
+          "${{ matrix.target }}"
+          "spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}"
+          "linux/${{ matrix.arch }}"
+
+      - name: Record exact image size
+        run: docker image inspect --format '{{.Architecture}} {{.Id}} {{.Size}}' 'spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}'
+
+      - name: Block fixable image findings
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25
+        with:
+          image-ref: spaceapp-ci:${{ matrix.target }}-${{ matrix.arch }}
+          severity: MEDIUM,HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
