@@ -1,0 +1,66 @@
+name: Temporal review validation
+on:
+  push:
+    branches: ['validation/60-temporal-review-20261028']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ubuntu-timing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: 45b0af0e5c532e6266d5e9083ea817d4cc5c726d
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+      - name: Install dependencies and build exports once
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = 45b0af0e5c532e6266d5e9083ea817d4cc5c726d
+          npm ci
+          npm run check
+      - name: Measure existing tests and complete worker suite
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, platform, subprocess, time
+          def timed(label, args):
+              start = time.monotonic()
+              result = subprocess.run(args)
+              elapsed = time.monotonic() - start
+              print(f'{label}: exit={result.returncode}, elapsed_seconds={elapsed:.3f}', flush=True)
+              if result.returncode: raise SystemExit(result.returncode)
+              return elapsed
+          baseline = timed('existing_worker_tests', ['npm', 'test', '-w', '@space/worker', '--', '--exclude', 'tests/workflow-sandbox.test.ts', '--exclude', 'tests/workflow-replay.test.ts'])
+          full = timed('complete_worker_suite', ['npm', 'test', '-w', '@space/worker'])
+          result = dict(source_commit=subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(), platform=platform.platform(), existing_tests_seconds=baseline, complete_suite_seconds=full, added_seconds=full-baseline)
+          print(json.dumps(result, indent=2), flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out: out.write('```json\n' + json.dumps(result, indent=2) + '\n```\n')
+          assert result['added_seconds'] < 180, result
+          PY
+      - name: Verify recorder safety and fresh output
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, subprocess, tempfile
+          source = pathlib.Path('apps/worker/tests/fixtures/workflow-histories')
+          def hashes(directory): return {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in directory.glob('*.json')}
+          before = hashes(source)
+          result = subprocess.run(['npm','run','temporal:record-histories','-w','@space/worker'], capture_output=True, text=True)
+          assert result.returncode != 0 and 'Refusing to overwrite workflow history:' in result.stderr
+          assert hashes(source) == before and len(before) == 9
+          with tempfile.TemporaryDirectory(prefix='workflow-history-validation-') as tmp:
+              destination = pathlib.Path(tmp) / 'fresh'
+              subprocess.run(['npm','run','temporal:record-histories','-w','@space/worker','--','--output',str(destination)], check=True)
+              recorded = hashes(destination)
+              assert set(recorded) == set(before)
+              result = subprocess.run(['npm','run','temporal:record-histories','-w','@space/worker','--','--output',str(destination)], capture_output=True, text=True)
+              assert result.returncode != 0 and 'Refusing to overwrite workflow history:' in result.stderr
+              assert hashes(destination) == recorded
+          assert hashes(source) == before
+          print('PASS: existing baselines preserved; fresh nine-file recording; second recording refused')
+          PY
